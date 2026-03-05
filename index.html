@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="TrainingPlan" />
+  <meta name="theme-color" content="#111318" />
+  <title>TrainingPlan</title>
+  <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%23111318'/><text y='.9em' font-size='72' x='12'>💪</text></svg>" />
+  <style>
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    body { margin: 0; padding: 0; background: #111318; }
+    input[type=number]::-webkit-inner-spin-button,
+    input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+    input[type=date]::-webkit-calendar-picker-indicator { filter: invert(1) opacity(0.4); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script type="text/babel">
+const { useState, useEffect, useCallback } = React;
+
+// ─── STORAGE (localStorage) ──────────────────────────────────────────────────
+const LS = {
+  get: (k) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : null; } catch { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+
+// ─── CONSTANTS ───────────────────────────────────────────────────────────────
+const muscleGroups = ["Brust","Rücken","Schultern","Bizeps","Trizeps","Bauch","Quadrizeps","Hamstrings","Gesäß","Waden","Unterarme"];
+const days = ["Montag","Dienstag","Mittwoch","Donnerstag","Freitag","Samstag","Sonntag"];
+const dayShort = ["MO","DI","MI","DO","FR","SA","SO"];
+
+// ─── DESIGN TOKENS ───────────────────────────────────────────────────────────
+const C = {
+  bg: "#111318", surface: "#1c1f26", surfaceHover: "#22262f",
+  border: "#2e3340", borderLight: "#3a3f4d",
+  textPrimary: "#f0f2f5", textSecondary: "#9aa3b2", textMuted: "#5c6473",
+  accent: "#7ee8a2", accentDim: "#1e3d2a", accentText: "#0d1a12",
+  red: "#ff6b6b", yellow: "#ffd166", blue: "#74b9ff", orange: "#fd9644",
+};
+
+const todayStr = () => new Date().toISOString().split("T")[0];
+const fmtDate = (iso) => { if (!iso) return ""; const [y,m,d]=iso.split("-"); return `${d}.${m}.${y}`; };
+
+// ─── SHARED STYLES ───────────────────────────────────────────────────────────
+const s = {
+  card: { background: C.surface, border: `1px solid ${C.border}`, borderRadius: 8 },
+  label: { fontSize: 10, fontWeight: 700, letterSpacing: "0.12em", color: C.textMuted, textTransform: "uppercase" },
+  input: { background: C.bg, border: `1px solid ${C.border}`, color: C.textPrimary, padding: "10px 12px", fontSize: 14, fontFamily: "inherit", borderRadius: 6, outline: "none", boxSizing: "border-box", width: "100%" },
+  btnPrimary: { background: C.accent, color: C.accentText, border: "none", padding: "10px 20px", cursor: "pointer", fontSize: 13, fontWeight: 700, fontFamily: "inherit", borderRadius: 6 },
+  btnSecondary: { background: C.surfaceHover, color: C.textSecondary, border: `1px solid ${C.border}`, padding: "10px 18px", cursor: "pointer", fontSize: 13, fontFamily: "inherit", borderRadius: 6 },
+};
+
+// ─── PROGRESS HELPERS ────────────────────────────────────────────────────────
+function buildProgressData(sessions) {
+  const byEx = {};
+  Object.values(sessions).forEach(session => {
+    (session.exercises||[]).forEach(ex => {
+      if (!byEx[ex.name]) byEx[ex.name] = [];
+      byEx[ex.name].push({ date: session.date, sets: ex.sets||[] });
+    });
+  });
+  Object.keys(byEx).forEach(n => byEx[n].sort((a,b)=>(a.date||"").localeCompare(b.date||"")));
+  return byEx;
+}
+
+function calcStats(sets) {
+  const v = sets.filter(s=>s.reps>0);
+  const volume = Math.round(v.reduce((a,s)=>a+(parseFloat(s.weight)||0)*(parseInt(s.reps)||0),0));
+  const maxWeight = Math.max(0,...v.map(s=>parseFloat(s.weight)||0));
+  const totalReps = v.reduce((a,s)=>a+(parseInt(s.reps)||0),0);
+  const avgReps = v.length>0?Math.round(totalReps/v.length):0;
+  return { volume, maxWeight, totalReps, setsCount: v.length, avgReps };
+}
+
+function TrendBadge({ first, last }) {
+  if (first===undefined||last===undefined||first===last) return null;
+  const diff = last-first, pct = first>0?Math.round((diff/first)*100):0, up = diff>0;
+  return React.createElement("span",{style:{fontSize:11,fontWeight:700,color:up?C.accent:C.red,background:up?C.accentDim:"#3d1a1a",padding:"2px 8px",borderRadius:20}},
+    `${up?"▲":"▼"} ${Math.abs(pct)}%`
+  );
+}
+
+// ─── PROGRESS CHART ──────────────────────────────────────────────────────────
+function ProgressChart({ data, dates, color, unit }) {
+  if (data.length < 2) return null;
+  const w=600,h=140,pl=44,pr=10,pt=10,pb=32;
+  const iw=w-pl-pr,ih=h-pt-pb;
+  const minV=Math.min(...data)*0.95, maxV=Math.max(...data)*1.05||1, range=maxV-minV||1;
+  const pts = data.map((v,i)=>({ x:pl+(i/(data.length-1))*iw, y:pt+ih-((v-minV)/range)*ih, v, d:dates[i] }));
+  const polyline = pts.map(p=>`${p.x},${p.y}`).join(" ");
+  const area = `M${pts[0].x},${pt+ih} `+pts.map(p=>`L${p.x},${p.y}`).join(" ")+` L${pts[pts.length-1].x},${pt+ih} Z`;
+  const yTicks=4;
+  return (
+    <div style={{overflowX:"auto"}}>
+      <svg viewBox={`0 0 ${w} ${h}`} style={{width:"100%",maxWidth:w,display:"block"}}>
+        <defs>
+          <linearGradient id="ag" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={color} stopOpacity="0.25"/>
+            <stop offset="100%" stopColor={color} stopOpacity="0.02"/>
+          </linearGradient>
+        </defs>
+        {Array.from({length:yTicks+1},(_,i)=>{
+          const y=pt+(i/yTicks)*ih, val=maxV-(i/yTicks)*range;
+          return React.createElement("g",{key:i},
+            React.createElement("line",{x1:pl,y1:y,x2:pl+iw,y2:y,stroke:C.border,strokeWidth:"1"}),
+            React.createElement("text",{x:pl-6,y:y+4,textAnchor:"end",fontSize:"10",fill:C.textMuted},Math.round(val))
+          );
+        })}
+        {pts.filter((_,i)=>data.length<=8||i%(Math.ceil(data.length/6))===0||i===data.length-1).map((p,i)=>
+          React.createElement("text",{key:i,x:p.x,y:h-6,textAnchor:"middle",fontSize:"9",fill:C.textMuted},fmtDate(p.d))
+        )}
+        <path d={area} fill="url(#ag)"/>
+        <polyline points={polyline} fill="none" stroke={color} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/>
+        {pts.map((p,i)=>React.createElement("circle",{key:i,cx:p.x,cy:p.y,r:i===pts.length-1?5:3.5,fill:color,stroke:C.surface,strokeWidth:"2"},
+          React.createElement("title",null,`${fmtDate(p.d)}: ${p.v} ${unit}`)
+        ))}
+      </svg>
+    </div>
+  );
+}
+
+// ─── MUSCLE PANEL ────────────────────────────────────────────────────────────
+function MuscleProgressPanel({ completedSessions }) {
+  const mv = {};
+  Object.values(completedSessions).forEach(s=>(s.exercises||[]).forEach(ex=>(ex.muscles||[]).forEach(m=>{
+    if(!mv[m])mv[m]=0;
+    mv[m]+=(ex.sets||[]).reduce((a,s2)=>a+(parseFloat(s2.weight)||0)*(parseInt(s2.reps)||0),0);
+  })));
+  const sorted = Object.entries(mv).sort((a,b)=>b[1]-a[1]);
+  if(!sorted.length) return null;
+  const maxV = sorted[0][1];
+  return (
+    <div style={{...s.card,overflow:"hidden",marginBottom:16}}>
+      <div style={{padding:"12px 16px",borderBottom:`1px solid ${C.border}`,...s.label}}>Muskelgruppen — Gesamtvolumen</div>
+      <div style={{padding:"14px 16px",display:"flex",flexDirection:"column",gap:10}}>
+        {sorted.map(([m,vol])=>(
+          <div key={m}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:5}}>
+              <span style={{fontSize:13,color:C.textPrimary,fontWeight:600}}>{m}</span>
+              <span style={{fontSize:12,color:C.textMuted}}>{Math.round(vol).toLocaleString("de-DE")} kg·Wdh</span>
+            </div>
+            <div style={{background:C.bg,borderRadius:4,height:6,overflow:"hidden"}}>
+              <div style={{background:C.accent,height:"100%",width:`${(vol/maxV)*100}%`,borderRadius:4}}/>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── EXERCISE FORM ───────────────────────────────────────────────────────────
+function ExerciseForm({ ex, setEx, onSave, onCancel, toggleMuscle }) {
+  return (
+    <div style={{...s.card,padding:"18px",marginTop:10,marginBottom:10}}>
+      <div style={{...s.label,marginBottom:12}}>Übung hinzufügen</div>
+      <input placeholder="Übungsname" value={ex.name} onChange={e=>setEx(p=>({...p,name:e.target.value}))} style={{...s.input,marginBottom:12}}/>
+      <div style={{display:"flex",gap:10,marginBottom:14}}>
+        {[["Sätze","sets",1,10],["Wiederholungen","reps",1,100]].map(([label,field,min,max])=>(
+          <div key={field} style={{flex:1}}>
+            <div style={{...s.label,marginBottom:6}}>{label}</div>
+            <input type="number" min={min} max={max} value={ex[field]} onChange={e=>setEx(p=>({...p,[field]:+e.target.value}))} style={{...s.input,textAlign:"center",fontWeight:700,fontSize:16}}/>
+          </div>
+        ))}
+      </div>
+      <div style={{marginBottom:14}}>
+        <div style={{...s.label,marginBottom:8}}>Muskelgruppen</div>
+        <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+          {muscleGroups.map(m=>(
+            <button key={m} onClick={()=>toggleMuscle(m)} style={{background:ex.muscles.includes(m)?C.accent:C.surfaceHover,color:ex.muscles.includes(m)?C.accentText:C.textSecondary,border:`1px solid ${ex.muscles.includes(m)?C.accent:C.border}`,padding:"5px 11px",cursor:"pointer",fontSize:11,fontFamily:"inherit",borderRadius:20,fontWeight:ex.muscles.includes(m)?700:400}}>{m}</button>
+          ))}
+        </div>
+      </div>
+      <div style={{display:"flex",gap:8}}>
+        <button onClick={onSave} style={{...s.btnPrimary,flex:1}}>Speichern</button>
+        <button onClick={onCancel} style={{...s.btnSecondary}}>Abbrechen</button>
+      </div>
+    </div>
+  );
+}
+
+// ─── MAIN APP ────────────────────────────────────────────────────────────────
+function App() {
+  const [templates, setTemplates] = useState(()=>LS.get("v2-templates")||[]);
+  const [dayConfig, setDayConfig] = useState(()=>LS.get("v2-dayconfig")||Object.fromEntries(days.map(d=>[d,{templateId:null,customExercises:[]}])));
+  const [completedSessions, setCompletedSessions] = useState(()=>LS.get("v2-log")||{});
+  const [activeDay, setActiveDay] = useState("Montag");
+  const [view, setView] = useState("plan");
+  const [sessionData, setSessionData] = useState({});
+  const [sessionDate, setSessionDate] = useState(todayStr());
+  const [sessionExercises, setSessionExercises] = useState([]);
+  const [toast, setToast] = useState(null);
+  const [editingTemplate, setEditingTemplate] = useState(null);
+  const [showAddExToTpl, setShowAddExToTpl] = useState(false);
+  const [newEx, setNewEx] = useState({name:"",muscles:[],sets:3,reps:10});
+  const [showAddCustomEx, setShowAddCustomEx] = useState(false);
+  const [newCustomEx, setNewCustomEx] = useState({name:"",muscles:[],sets:3,reps:10});
+  const [progressExercise, setProgressExercise] = useState(null);
+  const [progressMetric, setProgressMetric] = useState("maxWeight");
+
+  const persist = (key, val) => LS.set(key, val);
+  const showToast = (msg) => { setToast(msg); setTimeout(()=>setToast(null),2500); };
+
+  const setAndSaveTemplates = (val) => { setTemplates(val); persist("v2-templates",val); };
+  const setAndSaveDayConfig = (val) => { setDayConfig(val); persist("v2-dayconfig",val); };
+  const setAndSaveLog = (val) => { setCompletedSessions(val); persist("v2-log",val); };
+
+  const getActiveExercises = (day) => {
+    const cfg = dayConfig[day];
+    if (cfg.templateId) { const t=templates.find(t=>t.id===cfg.templateId); return t?t.exercises:[]; }
+    return cfg.customExercises||[];
+  };
+
+  const assignTemplate = (day, tid) => setAndSaveDayConfig({...dayConfig,[day]:{...dayConfig[day],templateId:tid||null}});
+
+  const addCustomExercise = () => {
+    if (!newCustomEx.name.trim()) return;
+    const ex = {...newCustomEx,id:Date.now()};
+    setAndSaveDayConfig({...dayConfig,[activeDay]:{...dayConfig[activeDay],customExercises:[...(dayConfig[activeDay].customExercises||[]),ex]}});
+    setNewCustomEx({name:"",muscles:[],sets:3,reps:10}); setShowAddCustomEx(false); showToast("Übung hinzugefügt ✓");
+  };
+
+  const removeCustomExercise = (day,id) => setAndSaveDayConfig({...dayConfig,[day]:{...dayConfig[day],customExercises:(dayConfig[day].customExercises||[]).filter(e=>e.id!==id)}});
+
+  const startSession = () => {
+    const exercises = getActiveExercises(activeDay);
+    if (!exercises.length) return;
+    const init={};
+    exercises.forEach(ex=>{ init[ex.id]=Array.from({length:ex.sets},()=>({reps:ex.reps,weight:""})); });
+    setSessionExercises(exercises); setSessionData(init); setSessionDate(todayStr()); setView("session");
+  };
+
+  const updateSet = (exId,setIdx,field,value) => setSessionData(prev=>{const c={...prev};c[exId]=c[exId].map((s,i)=>i===setIdx?{...s,[field]:value}:s);return c;});
+
+  const finishSession = () => {
+    const cfg=dayConfig[activeDay], tplName=cfg.templateId?(templates.find(t=>t.id===cfg.templateId)?.name||""):"";
+    const entry={day:activeDay,date:sessionDate,templateName:tplName,exercises:sessionExercises.map(ex=>({name:ex.name,muscles:ex.muscles,sets:sessionData[ex.id]}))};
+    const key=`${sessionDate}-${activeDay}-${Date.now()}`;
+    const newLog={...completedSessions,[key]:entry};
+    setAndSaveLog(newLog); setView("plan"); showToast("Training gespeichert 🎯");
+  };
+
+  const createTemplate = () => { setEditingTemplate({id:Date.now(),name:"",exercises:[],isNew:true}); setShowAddExToTpl(false); setNewEx({name:"",muscles:[],sets:3,reps:10}); };
+  const openTemplate = (t) => { setEditingTemplate({...t,isNew:false}); setShowAddExToTpl(false); setNewEx({name:"",muscles:[],sets:3,reps:10}); };
+
+  const saveTemplate = () => {
+    if (!editingTemplate.name.trim()) return;
+    const tpl={id:editingTemplate.id,name:editingTemplate.name,exercises:editingTemplate.exercises};
+    const updated=editingTemplate.isNew?[...templates,tpl]:templates.map(t=>t.id===tpl.id?tpl:t);
+    setAndSaveTemplates(updated); setEditingTemplate(null); showToast("Plan gespeichert ✓");
+  };
+
+  const deleteTemplate = (id) => {
+    setAndSaveTemplates(templates.filter(t=>t.id!==id));
+    const newDc={...dayConfig}; days.forEach(d=>{if(newDc[d].templateId===id)newDc[d]={...newDc[d],templateId:null}});
+    setAndSaveDayConfig(newDc); showToast("Plan gelöscht");
+  };
+
+  const addExToTemplate = () => {
+    if (!newEx.name.trim()) return;
+    setEditingTemplate(prev=>({...prev,exercises:[...prev.exercises,{...newEx,id:Date.now()}]}));
+    setNewEx({name:"",muscles:[],sets:3,reps:10}); setShowAddExToTpl(false);
+  };
+
+  const toggleMuscle = (m,setter) => setter(prev=>({...prev,muscles:prev.muscles.includes(m)?prev.muscles.filter(x=>x!==m):[...prev.muscles,m]}));
+
+  const sortedLog = Object.entries(completedSessions).sort((a,b)=>(b[1].date||"").localeCompare(a[1].date||""));
+
+  const getWeekLabel = (dateStr) => {
+    if (!dateStr) return "Unbekannt";
+    const d=new Date(dateStr),start=new Date(d); start.setDate(d.getDate()-((d.getDay()+6)%7));
+    const end=new Date(start); end.setDate(start.getDate()+6);
+    return `${fmtDate(start.toISOString().split("T")[0])} – ${fmtDate(end.toISOString().split("T")[0])}`;
+  };
+
+  const progressData = buildProgressData(completedSessions);
+  const exerciseNames = Object.keys(progressData).sort();
+  useEffect(()=>{ if(exerciseNames.length>0&&!progressExercise)setProgressExercise(exerciseNames[0]); },[exerciseNames.length]);
+
+  const metricOptions = [
+    {key:"maxWeight",label:"Max. Gewicht",unit:"kg",color:C.accent},
+    {key:"volume",label:"Volumen",unit:"kg·Wdh",color:C.blue},
+    {key:"totalReps",label:"Gesamt Wdh.",unit:"",color:C.yellow},
+    {key:"setsCount",label:"Sätze",unit:"",color:C.orange},
+  ];
+  const selectedHistory = progressExercise?(progressData[progressExercise]||[]):[];
+  const selectedStats = selectedHistory.map(h=>calcStats(h.sets));
+
+  const navTo = (v) => { setView(v); setEditingTemplate(null); };
+
+  return (
+    <div style={{minHeight:"100vh",background:C.bg,color:C.textPrimary,fontFamily:"'-apple-system','Inter','Segoe UI',sans-serif",fontSize:14,paddingTop:"env(safe-area-inset-top)"}}>
+
+      {toast && <div style={{position:"fixed",top:20,left:"50%",transform:"translateX(-50%)",background:C.accent,color:C.accentText,padding:"11px 24px",borderRadius:8,fontWeight:700,fontSize:13,zIndex:999,boxShadow:"0 4px 24px rgba(0,0,0,.5)",whiteSpace:"nowrap"}}>{toast}</div>}
+
+      <div style={{maxWidth:680,margin:"0 auto",padding:"0 16px 120px"}}>
+
+        {/* HEADER */}
+        <div style={{padding:"28px 0 20px",borderBottom:`1px solid ${C.border}`,marginBottom:20}}>
+          <div style={{fontSize:11,fontWeight:600,letterSpacing:"0.15em",color:C.textMuted,marginBottom:4}}>PERSONAL</div>
+          <h1 style={{margin:0,fontSize:28,fontWeight:800,color:C.textPrimary,letterSpacing:"-0.03em"}}>Training<span style={{color:C.accent}}>Plan</span></h1>
+        </div>
+
+        {/* NAV */}
+        {view!=="session" && (
+          <div style={{display:"flex",gap:6,marginBottom:24,flexWrap:"wrap"}}>
+            {[["plan","📋 Woche"],["templates","📁 Pläne"],["progress","📈 Fortschritt"],["log","🗓 Verlauf"]].map(([v,label])=>(
+              <button key={v} onClick={()=>navTo(v)} style={{background:view===v?C.accent:C.surface,color:view===v?C.accentText:C.textSecondary,border:`1px solid ${view===v?C.accent:C.border}`,padding:"9px 16px",cursor:"pointer",fontSize:13,fontWeight:view===v?700:500,fontFamily:"inherit",borderRadius:8}}>{label}</button>
+            ))}
+          </div>
+        )}
+
+        {/* ── PLAN VIEW ── */}
+        {view==="plan" && (
+          <div>
+            <div style={{display:"flex",gap:4,marginBottom:20}}>
+              {days.map((day,i)=>{
+                const exCount=getActiveExercises(day).length, hasTpl=!!dayConfig[day].templateId, isActive=activeDay===day;
+                return <button key={day} onClick={()=>setActiveDay(day)} style={{flex:1,background:isActive?C.accent:C.surface,color:isActive?C.accentText:C.textMuted,border:`1px solid ${isActive?C.accent:C.border}`,padding:"9px 2px",cursor:"pointer",fontSize:10,fontWeight:isActive?800:500,fontFamily:"inherit",borderRadius:6}}>
+                  {dayShort[i]}
+                  <div style={{fontSize:9,marginTop:3,color:exCount>0?(isActive?C.accentText:C.accent):"inherit"}}>{exCount>0?(hasTpl?"●":String(exCount)):"·"}</div>
+                </button>;
+              })}
+            </div>
+
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+              <div>
+                <div style={{...s.label,marginBottom:4}}>Trainingstag</div>
+                <div style={{fontSize:22,fontWeight:800,color:C.textPrimary}}>{activeDay}</div>
+              </div>
+              {getActiveExercises(activeDay).length>0 && <button onClick={startSession} style={{...s.btnPrimary,fontSize:14,padding:"11px 24px"}}>▶ Training starten</button>}
+            </div>
+
+            <div style={{...s.card,padding:"14px 16px",marginBottom:16}}>
+              <div style={{...s.label,marginBottom:10}}>Trainingsplan für diesen Tag</div>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                <button onClick={()=>assignTemplate(activeDay,null)} style={{background:!dayConfig[activeDay].templateId?C.surfaceHover:"transparent",color:!dayConfig[activeDay].templateId?C.textPrimary:C.textMuted,border:`1px solid ${!dayConfig[activeDay].templateId?C.borderLight:C.border}`,padding:"6px 13px",cursor:"pointer",fontSize:12,fontFamily:"inherit",borderRadius:6,fontWeight:!dayConfig[activeDay].templateId?700:400}}>Individuell</button>
+                {templates.map(t=>(
+                  <button key={t.id} onClick={()=>assignTemplate(activeDay,t.id)} style={{background:dayConfig[activeDay].templateId===t.id?C.accent:"transparent",color:dayConfig[activeDay].templateId===t.id?C.accentText:C.textSecondary,border:`1px solid ${dayConfig[activeDay].templateId===t.id?C.accent:C.border}`,padding:"6px 13px",cursor:"pointer",fontSize:12,fontFamily:"inherit",borderRadius:6,fontWeight:dayConfig[activeDay].templateId===t.id?700:400}}>{t.name}</button>
+                ))}
+                {templates.length===0 && <span style={{fontSize:12,color:C.textMuted,alignSelf:"center"}}>Unter „Pläne" Trainingspläne erstellen</span>}
+              </div>
+            </div>
+
+            {getActiveExercises(activeDay).length===0 ? (
+              <div style={{...s.card,padding:"40px 24px",textAlign:"center",borderStyle:"dashed"}}>
+                <div style={{fontSize:32,marginBottom:10}}>＋</div>
+                <div style={{color:C.textMuted,fontSize:13}}>{dayConfig[activeDay].templateId?"Dieser Plan hat keine Übungen":"Keine Übungen für diesen Tag"}</div>
+              </div>
+            ) : (
+              <div style={{display:"flex",flexDirection:"column",gap:8}}>
+                {getActiveExercises(activeDay).map((ex,i)=>(
+                  <div key={ex.id} style={{...s.card,padding:"14px 16px",display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                    <div>
+                      <div style={{...s.label,marginBottom:4}}>#{String(i+1).padStart(2,"0")}</div>
+                      <div style={{fontWeight:700,fontSize:15,color:C.textPrimary,marginBottom:5}}>{ex.name}</div>
+                      <div style={{display:"flex",gap:12,fontSize:13,color:C.textSecondary}}>
+                        <span><span style={{color:C.accent,fontWeight:700}}>{ex.sets}</span> Sätze</span>
+                        <span><span style={{color:C.accent,fontWeight:700}}>{ex.reps}</span> Wdh.</span>
+                      </div>
+                      {ex.muscles&&ex.muscles.length>0&&<div style={{marginTop:8,display:"flex",flexWrap:"wrap",gap:5}}>{ex.muscles.map(m=><span key={m} style={{fontSize:10,background:C.bg,border:`1px solid ${C.border}`,padding:"2px 8px",borderRadius:20,color:C.textSecondary}}>{m}</span>)}</div>}
+                    </div>
+                    {!dayConfig[activeDay].templateId && <button onClick={()=>removeCustomExercise(activeDay,ex.id)} style={{background:"none",border:"none",color:C.textMuted,cursor:"pointer",fontSize:18,padding:"2px 6px"}}>✕</button>}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {!dayConfig[activeDay].templateId && (
+              <>
+                <button onClick={()=>setShowAddCustomEx(!showAddCustomEx)} style={{marginTop:10,width:"100%",background:"transparent",border:`1px dashed ${C.border}`,color:C.textMuted,padding:"12px",cursor:"pointer",fontSize:13,fontFamily:"inherit",borderRadius:8}}>+ Übung hinzufügen</button>
+                {showAddCustomEx && <ExerciseForm ex={newCustomEx} setEx={setNewCustomEx} onSave={addCustomExercise} onCancel={()=>setShowAddCustomEx(false)} toggleMuscle={m=>toggleMuscle(m,setNewCustomEx)}/>}
+              </>
+            )}
+          </div>
+        )}
+
+        {/* ── TEMPLATES LIST ── */}
+        {view==="templates" && !editingTemplate && (
+          <div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+              <div style={{fontWeight:700,fontSize:18,color:C.textPrimary}}>Meine Trainingspläne</div>
+              <button onClick={createTemplate} style={s.btnPrimary}>+ Neuer Plan</button>
+            </div>
+            {templates.length===0 ? (
+              <div style={{...s.card,padding:"48px 24px",textAlign:"center",borderStyle:"dashed"}}>
+                <div style={{fontSize:32,marginBottom:12}}>📋</div>
+                <div style={{color:C.textSecondary,fontSize:14,marginBottom:4}}>Noch keine Pläne erstellt.</div>
+                <div style={{color:C.textMuted,fontSize:12}}>Erstelle Pläne und weise sie den Wochentagen zu.</div>
+              </div>
+            ) : (
+              <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                {templates.map(t=>(
+                  <div key={t.id} style={{...s.card,overflow:"hidden"}}>
+                    <div style={{padding:"14px 16px",display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:`1px solid ${C.border}`}}>
+                      <div>
+                        <div style={{fontWeight:700,fontSize:15,color:C.textPrimary}}>{t.name}</div>
+                        <div style={{fontSize:12,color:C.textMuted,marginTop:2}}>{t.exercises.length} Übungen</div>
+                      </div>
+                      <div style={{display:"flex",gap:6}}>
+                        <button onClick={()=>openTemplate(t)} style={{...s.btnSecondary,padding:"7px 14px",fontSize:12}}>Bearbeiten</button>
+                        <button onClick={()=>deleteTemplate(t.id)} style={{background:"none",border:`1px solid ${C.border}`,color:C.textMuted,padding:"7px 11px",cursor:"pointer",fontSize:13,fontFamily:"inherit",borderRadius:6}}>✕</button>
+                      </div>
+                    </div>
+                    <div style={{padding:"12px 16px",display:"flex",flexWrap:"wrap",gap:6}}>
+                      {t.exercises.map(ex=><span key={ex.id} style={{fontSize:12,background:C.bg,border:`1px solid ${C.border}`,padding:"4px 10px",borderRadius:6,color:C.textSecondary}}>{ex.name} <span style={{color:C.accent,fontWeight:700}}>{ex.sets}×{ex.reps}</span></span>)}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── TEMPLATE EDITOR ── */}
+        {view==="templates" && editingTemplate && (
+          <div>
+            <button onClick={()=>setEditingTemplate(null)} style={{background:"none",border:"none",color:C.textSecondary,cursor:"pointer",fontSize:13,fontFamily:"inherit",padding:0,marginBottom:16}}>← Zurück zu Plänen</button>
+            <div style={{fontWeight:700,fontSize:18,color:C.textPrimary,marginBottom:16}}>{editingTemplate.isNew?"Neuer Trainingsplan":"Plan bearbeiten"}</div>
+            <input placeholder="Planname (z.B. Push Day, Leg Day...)" value={editingTemplate.name} onChange={e=>setEditingTemplate(p=>({...p,name:e.target.value}))} style={{...s.input,marginBottom:16,fontSize:16,fontWeight:700}}/>
+            <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:10}}>
+              {editingTemplate.exercises.map(ex=>(
+                <div key={ex.id} style={{...s.card,padding:"12px 16px",display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                  <div>
+                    <div style={{fontWeight:700,fontSize:14,color:C.textPrimary,marginBottom:4}}>{ex.name}</div>
+                    <div style={{fontSize:12,color:C.textSecondary}}><span style={{color:C.accent,fontWeight:700}}>{ex.sets}</span> Sätze · <span style={{color:C.accent,fontWeight:700}}>{ex.reps}</span> Wdh.</div>
+                    {ex.muscles&&ex.muscles.length>0&&<div style={{marginTop:7,display:"flex",flexWrap:"wrap",gap:5}}>{ex.muscles.map(m=><span key={m} style={{fontSize:10,background:C.bg,border:`1px solid ${C.border}`,padding:"2px 8px",borderRadius:20,color:C.textMuted}}>{m}</span>)}</div>}
+                  </div>
+                  <button onClick={()=>setEditingTemplate(p=>({...p,exercises:p.exercises.filter(e=>e.id!==ex.id)}))} style={{background:"none",border:"none",color:C.textMuted,cursor:"pointer",fontSize:18,padding:"2px 6px"}}>✕</button>
+                </div>
+              ))}
+            </div>
+            <button onClick={()=>setShowAddExToTpl(!showAddExToTpl)} style={{width:"100%",background:"transparent",border:`1px dashed ${C.border}`,color:C.textMuted,padding:"12px",cursor:"pointer",fontSize:13,fontFamily:"inherit",borderRadius:8,marginBottom:12}}>+ Übung hinzufügen</button>
+            {showAddExToTpl && <ExerciseForm ex={newEx} setEx={setNewEx} onSave={addExToTemplate} onCancel={()=>setShowAddExToTpl(false)} toggleMuscle={m=>toggleMuscle(m,setNewEx)}/>}
+            <div style={{display:"flex",gap:8,marginTop:8}}>
+              <button onClick={saveTemplate} style={{...s.btnPrimary,flex:1,fontSize:14}}>Plan speichern</button>
+              <button onClick={()=>setEditingTemplate(null)} style={s.btnSecondary}>Abbrechen</button>
+            </div>
+          </div>
+        )}
+
+        {/* ── SESSION VIEW ── */}
+        {view==="session" && (
+          <div style={{paddingTop:8}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+              <div>
+                <div style={{...s.label,color:C.accent,marginBottom:4}}>Aktives Training</div>
+                <div style={{fontSize:22,fontWeight:800,color:C.textPrimary}}>{activeDay}</div>
+                {dayConfig[activeDay].templateId&&templates.find(t=>t.id===dayConfig[activeDay].templateId)&&<div style={{fontSize:13,color:C.textSecondary,marginTop:2}}>{templates.find(t=>t.id===dayConfig[activeDay].templateId).name}</div>}
+              </div>
+              <button onClick={()=>setView("plan")} style={{...s.btnSecondary,padding:"8px 14px"}}>✕ Abbrechen</button>
+            </div>
+            <div style={{...s.card,padding:"14px 16px",marginBottom:20}}>
+              <div style={{...s.label,marginBottom:8}}>Datum des Trainings</div>
+              <input type="date" value={sessionDate} onChange={e=>setSessionDate(e.target.value)} style={{...s.input,colorScheme:"dark",fontSize:15,fontWeight:700}}/>
+            </div>
+            {sessionExercises.map((ex,ei)=>(
+              <div key={ex.id} style={{...s.card,marginBottom:14,padding:"16px"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:14}}>
+                  <div>
+                    <div style={{...s.label,marginBottom:3}}>#{String(ei+1).padStart(2,"0")}</div>
+                    <div style={{fontWeight:700,fontSize:16,color:C.textPrimary}}>{ex.name}</div>
+                  </div>
+                  {ex.muscles&&ex.muscles.length>0&&<div style={{display:"flex",gap:4,flexWrap:"wrap",justifyContent:"flex-end",maxWidth:"55%"}}>{ex.muscles.map(m=><span key={m} style={{fontSize:10,background:C.bg,border:`1px solid ${C.border}`,padding:"2px 7px",borderRadius:20,color:C.textMuted}}>{m}</span>)}</div>}
+                </div>
+                <div style={{display:"grid",gridTemplateColumns:"36px 1fr 1fr",gap:6,marginBottom:6}}>
+                  {["Satz","Wdh.","kg"].map(h=><div key={h} style={{...s.label,textAlign:"center",fontSize:10}}>{h}</div>)}
+                </div>
+                {sessionData[ex.id]?.map((set,si)=>(
+                  <div key={si} style={{display:"grid",gridTemplateColumns:"36px 1fr 1fr",gap:6,marginBottom:6,alignItems:"center"}}>
+                    <div style={{fontWeight:700,fontSize:13,color:C.textMuted,textAlign:"center",background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,padding:"10px 0"}}>{si+1}</div>
+                    <input type="number" inputMode="decimal" value={set.reps} onChange={e=>updateSet(ex.id,si,"reps",e.target.value)} style={{...s.input,textAlign:"center",fontWeight:700,fontSize:16,padding:"10px"}}/>
+                    <input type="number" inputMode="decimal" value={set.weight} placeholder="–" onChange={e=>updateSet(ex.id,si,"weight",e.target.value)} style={{...s.input,textAlign:"center",fontWeight:700,fontSize:16,padding:"10px",color:C.accent}}/>
+                  </div>
+                ))}
+              </div>
+            ))}
+            <button onClick={finishSession} style={{width:"100%",background:C.accent,color:C.accentText,border:"none",padding:"16px",cursor:"pointer",fontSize:15,fontWeight:800,fontFamily:"inherit",borderRadius:8,marginTop:8}}>✓ Training abschließen</button>
+          </div>
+        )}
+
+        {/* ── PROGRESS VIEW ── */}
+        {view==="progress" && (
+          <div>
+            <div style={{fontWeight:700,fontSize:18,color:C.textPrimary,marginBottom:6}}>Fortschritt</div>
+            <div style={{fontSize:13,color:C.textSecondary,marginBottom:20}}>Entwicklung deiner Leistung über alle Trainings.</div>
+            {exerciseNames.length===0 ? (
+              <div style={{...s.card,padding:"48px 24px",textAlign:"center",borderStyle:"dashed"}}>
+                <div style={{fontSize:32,marginBottom:12}}>📈</div>
+                <div style={{color:C.textSecondary,fontSize:14,marginBottom:4}}>Noch keine Daten vorhanden.</div>
+                <div style={{color:C.textMuted,fontSize:12}}>Schließe Trainings ab, um deinen Fortschritt zu sehen.</div>
+              </div>
+            ) : (
+              <>
+                <div style={{...s.card,padding:"14px 16px",marginBottom:16}}>
+                  <div style={{...s.label,marginBottom:10}}>Übung auswählen</div>
+                  <div style={{display:"flex",flexWrap:"wrap",gap:6}}>
+                    {exerciseNames.map(name=>(
+                      <button key={name} onClick={()=>setProgressExercise(name)} style={{background:progressExercise===name?C.accent:C.surfaceHover,color:progressExercise===name?C.accentText:C.textSecondary,border:`1px solid ${progressExercise===name?C.accent:C.border}`,padding:"6px 13px",cursor:"pointer",fontSize:12,fontFamily:"inherit",borderRadius:6,fontWeight:progressExercise===name?700:400}}>{name}</button>
+                    ))}
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:6,marginBottom:16,flexWrap:"wrap"}}>
+                  {metricOptions.map(m=>(
+                    <button key={m.key} onClick={()=>setProgressMetric(m.key)} style={{background:progressMetric===m.key?m.color:C.surface,color:progressMetric===m.key?C.accentText:C.textSecondary,border:`1px solid ${progressMetric===m.key?m.color:C.border}`,padding:"7px 14px",cursor:"pointer",fontSize:12,fontFamily:"inherit",borderRadius:6,fontWeight:progressMetric===m.key?700:400}}>{m.label}</button>
+                  ))}
+                </div>
+                {progressExercise && selectedHistory.length>0 && (()=>{
+                  const metric=metricOptions.find(m=>m.key===progressMetric);
+                  const values=selectedStats.map(s=>s[progressMetric]);
+                  const first=values[0],last=values[values.length-1],max=Math.max(...values);
+                  return (
+                    <>
+                      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:16}}>
+                        {[
+                          {label:"Erster Wert",value:`${first}${metric.unit?" "+metric.unit:""}`,sub:fmtDate(selectedHistory[0].date)},
+                          {label:"Aktuell",value:`${last}${metric.unit?" "+metric.unit:""}`,sub:fmtDate(selectedHistory[selectedHistory.length-1].date),hi:true},
+                          {label:"Bestleistung",value:`${max}${metric.unit?" "+metric.unit:""}`,sub:`${selectedHistory.length} Einheiten`},
+                        ].map((card,ci)=>(
+                          <div key={ci} style={{...s.card,padding:"14px",background:card.hi?C.accentDim:C.surface,border:`1px solid ${card.hi?C.accent:C.border}`}}>
+                            <div style={{...s.label,marginBottom:6,color:card.hi?C.accent:C.textMuted}}>{card.label}</div>
+                            <div style={{fontWeight:800,fontSize:18,color:card.hi?C.accent:C.textPrimary}}>{card.value}</div>
+                            <div style={{fontSize:11,color:C.textMuted,marginTop:3}}>{card.sub}</div>
+                          </div>
+                        ))}
+                      </div>
+                      {values.length>=2 && (
+                        <div style={{...s.card,padding:"12px 16px",marginBottom:16,display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+                          <div style={{fontSize:13,color:C.textSecondary}}>Gesamtentwicklung:</div>
+                          <TrendBadge first={first} last={last}/>
+                          <div style={{fontSize:12,color:C.textMuted}}>{last>first?`+${last-first} ${metric.unit} seit Beginn`:last<first?`${last-first} ${metric.unit} seit Beginn`:"Keine Veränderung"}</div>
+                        </div>
+                      )}
+                      {values.length>=2 && (
+                        <div style={{...s.card,padding:"20px",marginBottom:16}}>
+                          <div style={{...s.label,marginBottom:16}}>{metric.label} über Zeit</div>
+                          <ProgressChart data={values} dates={selectedHistory.map(h=>h.date)} color={metric.color} unit={metric.unit}/>
+                        </div>
+                      )}
+                      <div style={{...s.card,overflow:"hidden",marginBottom:16}}>
+                        <div style={{padding:"12px 16px",borderBottom:`1px solid ${C.border}`,...s.label}}>Alle Einheiten — {progressExercise}</div>
+                        {[...selectedHistory].reverse().map((session,idx)=>{
+                          const stat=calcStats(session.sets);
+                          const prevIdx=selectedHistory.length-2-idx;
+                          const prev=prevIdx>=0?calcStats(selectedHistory[prevIdx].sets):null;
+                          return (
+                            <div key={idx} style={{padding:"12px 16px",borderBottom:idx<selectedHistory.length-1?`1px solid ${C.border}`:"none",display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                              <div>
+                                <div style={{fontWeight:600,fontSize:13,color:C.textPrimary,marginBottom:4}}>{fmtDate(session.date)}</div>
+                                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                                  {session.sets.map((set,si)=>(
+                                    <span key={si} style={{fontSize:11,background:C.bg,border:`1px solid ${C.border}`,padding:"2px 8px",borderRadius:5,color:C.textSecondary}}>
+                                      <span style={{color:C.textPrimary,fontWeight:600}}>{set.reps}</span> × <span style={{color:C.accent,fontWeight:700}}>{set.weight||"–"} kg</span>
+                                    </span>
+                                  ))}
+                                </div>
+                              </div>
+                              <div style={{textAlign:"right",minWidth:90}}>
+                                <div style={{fontSize:15,fontWeight:800,color:C.textPrimary}}>{stat.maxWeight>0?`${stat.maxWeight} kg`:"–"}</div>
+                                <div style={{fontSize:11,color:C.textMuted}}>{stat.setsCount} × {stat.avgReps} Wdh.</div>
+                                {prev&&stat.maxWeight>0&&prev.maxWeight>0&&stat.maxWeight!==prev.maxWeight&&(
+                                  <span style={{fontSize:10,fontWeight:700,color:stat.maxWeight>prev.maxWeight?C.accent:C.red}}>{stat.maxWeight>prev.maxWeight?"▲":"▼"} {Math.abs(stat.maxWeight-prev.maxWeight)} kg</span>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      <MuscleProgressPanel completedSessions={completedSessions}/>
+                    </>
+                  );
+                })()}
+                {progressExercise&&selectedHistory.length===0&&<div style={{...s.card,padding:"32px",textAlign:"center",color:C.textMuted,fontSize:13}}>Keine Daten für diese Übung.</div>}
+              </>
+            )}
+          </div>
+        )}
+
+        {/* ── LOG VIEW ── */}
+        {view==="log" && (
+          <div>
+            <div style={{fontWeight:700,fontSize:18,color:C.textPrimary,marginBottom:20}}>Trainingsverlauf</div>
+            {sortedLog.length===0 ? (
+              <div style={{...s.card,padding:"48px 24px",textAlign:"center",borderStyle:"dashed"}}>
+                <div style={{fontSize:32,marginBottom:12}}>🗓</div>
+                <div style={{color:C.textSecondary,fontSize:14}}>Noch keine abgeschlossenen Trainings</div>
+              </div>
+            ) : (()=>{
+              const weeks={};
+              sortedLog.forEach(([key,session])=>{ const wk=getWeekLabel(session.date); if(!weeks[wk])weeks[wk]=[]; weeks[wk].push([key,session]); });
+              return Object.entries(weeks).map(([week,entries])=>(
+                <div key={week} style={{marginBottom:28}}>
+                  <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.1em",color:C.accent,marginBottom:10,paddingBottom:8,borderBottom:`1px solid ${C.border}`}}>KW · {week}</div>
+                  {entries.map(([key,session])=>(
+                    <div key={key} style={{...s.card,marginBottom:10,overflow:"hidden"}}>
+                      <div style={{padding:"12px 16px",borderBottom:`1px solid ${C.border}`,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                        <div>
+                          <div style={{fontWeight:700,fontSize:14,color:C.textPrimary}}>{session.day}</div>
+                          {session.templateName&&<div style={{fontSize:11,color:C.accent,marginTop:2}}>{session.templateName}</div>}
+                        </div>
+                        <div style={{fontSize:12,color:C.textSecondary}}>{fmtDate(session.date)}</div>
+                      </div>
+                      <div style={{padding:"12px 16px"}}>
+                        {(session.exercises||[]).map((ex,i)=>(
+                          <div key={i} style={{marginBottom:10,paddingBottom:10,borderBottom:i<(session.exercises.length-1)?`1px solid ${C.border}`:"none"}}>
+                            <div style={{fontSize:12,fontWeight:700,color:C.textSecondary,marginBottom:6}}>{ex.name}</div>
+                            <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
+                              {(ex.sets||[]).map((set,si)=>(
+                                <div key={si} style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:6,padding:"4px 10px",fontSize:11}}>
+                                  <span style={{color:C.textPrimary,fontWeight:600}}>{set.reps}</span> × <span style={{color:C.accent,fontWeight:700}}>{set.weight||"–"} kg</span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ));
+            })()}
+          </div>
+        )}
+
+      </div>
+
+      {/* Bottom nav bar for iOS feel */}
+      {view!=="session" && (
+        <div style={{position:"fixed",bottom:0,left:0,right:0,background:C.surface,borderTop:`1px solid ${C.border}`,display:"flex",paddingBottom:"env(safe-area-inset-bottom)",zIndex:100}}>
+          {[["plan","📋","Woche"],["templates","📁","Pläne"],["progress","📈","Fortschritt"],["log","🗓","Verlauf"]].map(([v,icon,label])=>(
+            <button key={v} onClick={()=>navTo(v)} style={{flex:1,background:"none",border:"none",padding:"10px 0 8px",cursor:"pointer",fontFamily:"inherit",display:"flex",flexDirection:"column",alignItems:"center",gap:2}}>
+              <span style={{fontSize:20}}>{icon}</span>
+              <span style={{fontSize:10,fontWeight:view===v?700:400,color:view===v?C.accent:C.textMuted}}>{label}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+  </script>
+</body>
+</html>
