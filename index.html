@@ -27,6 +27,7 @@
     body.light input[type=date]::-webkit-calendar-picker-indicator{filter:none;opacity:0.5;cursor:pointer}
     .mo{position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:200;display:flex;align-items:flex-end;justify-content:center}
     .ms{border-radius:16px 16px 0 0;padding:24px 20px 44px;width:100%;max-width:680px;max-height:92vh;overflow-y:auto}
+    @keyframes spin{to{transform:rotate(360deg)}}
     @keyframes timerPulse{0%,100%{opacity:1}50%{opacity:.5}}
     @keyframes prPop{0%{transform:scale(0.5);opacity:0}70%{transform:scale(1.15)}100%{transform:scale(1);opacity:1}}
     @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
@@ -181,7 +182,7 @@ self.addEventListener('fetch',e=>{
 <script type="text/babel">
 const {useState,useEffect,useRef,useCallback}=React;
 
-const APP_VERSION="1.0.7";
+const APP_VERSION="1.1.0";
 
 // ── STORAGE (localStorage fallback) ──────────────────────────────────────────
 const LS={
@@ -951,6 +952,27 @@ function Toast({msg}){
   return msg?<div style={{position:"fixed",top:20,left:"50%",transform:"translateX(-50%)",background:C.accent,color:C.accentText,padding:"11px 24px",borderRadius:8,fontWeight:700,fontSize:13,zIndex:999,boxShadow:"0 4px 24px rgba(0,0,0,.5)",whiteSpace:"nowrap"}}>{msg}</div>:null;
 }
 
+// ── SYNC OVERLAY ─────────────────────────────────────────────────────────────
+function SyncOverlay({msg}){
+  if(!msg)return null;
+  return(
+    <div style={{position:"fixed",bottom:90,left:"50%",transform:"translateX(-50%)",zIndex:1200,
+      background:"rgba(0,0,0,0.82)",backdropFilter:"blur(8px)",
+      border:"1px solid rgba(255,255,255,0.08)",
+      borderRadius:12,padding:"12px 20px",
+      display:"flex",alignItems:"center",gap:10,
+      boxShadow:"0 4px 32px rgba(0,0,0,0.5)",
+      pointerEvents:"none",
+      whiteSpace:"nowrap"}}>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" style={{flexShrink:0,animation:"spin 1s linear infinite"}}>
+        <circle cx="12" cy="12" r="9" stroke="rgba(255,255,255,0.2)" strokeWidth="3"/>
+        <path d="M12 3a9 9 0 0 1 9 9" stroke="#6ee7b7" strokeWidth="3" strokeLinecap="round"/>
+      </svg>
+      <span style={{fontSize:13,fontWeight:600,color:"#fff"}}>{msg}</span>
+    </div>
+  );
+}
+
 // ── SETTINGS MODAL ───────────────────────────────────────────────────────────
 function SettingsModal({settings,onSave,onClose,onExport,onImport}){
   const [s,setS]=useState({...settings});
@@ -1215,6 +1237,8 @@ function App(){
   const [settings,setSettings]=useState({timerEnabled:false,timerDuration:90});
   const [darkMode,setDarkMode]=useState(()=>LS.get("jt-darkmode")!==false);
   const [dataLoading,setDataLoading]=useState(false);
+  const [syncMsg,setSyncMsg]=useState(null);
+  const sync=async(msg,fn)=>{setSyncMsg(msg);try{return await fn();}finally{setSyncMsg(null);}};
 
   // Load all data from Supabase
   const loadAllData=async(uid)=>{
@@ -1315,7 +1339,7 @@ function App(){
   const saveSettings=async(v)=>{
     setSettings(v);
     LS.set("jt-settings",v);
-    if(uid){try{await DB.upsertSettings(uid,{...v,darkMode});}catch(e){console.error(e);}}
+    if(uid){await sync("Einstellungen werden gespeichert…",()=>DB.upsertSettings(uid,{...v,darkMode}).catch(e=>console.error(e)));}
   };
   const navTo=(v)=>{setView(v);setEditingTpl(null);};
 
@@ -1429,6 +1453,7 @@ function App(){
     if(prs.length>0)setTimeout(()=>setPrPopup(prs),300);
     // Im Hintergrund zu Supabase hochladen — ohne den Nutzer zu blockieren
     if(uid){
+      setSyncMsg("Training wird synchronisiert…");
       DB.insertSession(uid,entry).then(row=>{
         // Lokalen Eintrag durch DB-Eintrag ersetzen
         setSessions(prev=>{
@@ -1437,9 +1462,10 @@ function App(){
           u[row.id]={...entry,_dbId:row.id};
           return u;
         });
+      setSyncMsg(null);
       }).catch(e=>{
         console.error("Session sync error:",e);
-        // Bleibt lokal gespeichert — kein Datenverlust
+        setSyncMsg(null);
       });
     }
   };
@@ -1455,7 +1481,7 @@ function App(){
     const tpl={id:editingTpl.id,name:editingTpl.name,exercises:editingTpl.exercises,_dbId:editingTpl._dbId};
     try{
       if(uid){
-        const row=await DB.upsertTemplate(uid,tpl);
+        const row=await sync("Plan wird gespeichert…",()=>DB.upsertTemplate(uid,tpl));
         tpl._dbId=row.id;
         tpl.id=row.id;
       }
@@ -1488,7 +1514,7 @@ function App(){
   const openEditSession=(key)=>setEditingSession({key,session:deepClone(sessions[key])});
   const saveEditedSession=async(key,updated)=>{
     try{
-      if(uid&&sessions[key]?._dbId)await DB.updateSession(sessions[key]._dbId,updated);
+      if(uid&&sessions[key]?._dbId)await sync("Training wird aktualisiert…",()=>DB.updateSession(sessions[key]._dbId,updated));
     }catch(e){console.error(e);}
     setSessions(prev=>({...prev,[key]:{...updated,_dbId:prev[key]?._dbId}}));
     setEditingSession(null);showToast("Training aktualisiert ✓");
@@ -1506,7 +1532,7 @@ function App(){
     if(!ex.name.trim())return;
     const entry={id:genId(),name:ex.name,muscles:ex.muscles||[],sets:ex.sets||3,reps:ex.reps||10};
     setLibrary(prev=>[...prev.filter(l=>l.name!==ex.name),entry]);
-    try{if(uid)await DB.upsertLibraryEntry(uid,entry);}catch(e){console.error(e);}
+    try{if(uid)await sync("Bibliothek wird gespeichert…",()=>DB.upsertLibraryEntry(uid,entry));}catch(e){console.error(e);}
     showToast("Zur Bibliothek hinzugefügt ✓");
   };
   const deleteLibraryEntry=async(id)=>{
@@ -1518,7 +1544,7 @@ function App(){
   // ─ BODY WEIGHT ─
   const addBodyWeight=async(entry)=>{
     setBodyWeight(prev=>[...prev.filter(e=>e.date!==entry.date),entry].sort((a,b)=>a.date.localeCompare(b.date)));
-    try{if(uid)await DB.upsertBodyWeight(uid,entry);}catch(e){console.error(e);}
+    try{if(uid)await sync("Gewicht wird gespeichert…",()=>DB.upsertBodyWeight(uid,entry));}catch(e){console.error(e);}
     showToast("Gewicht gespeichert ✓");
   };
   const deleteBodyWeight=async(id)=>{
@@ -1541,6 +1567,7 @@ function App(){
       if(!uid){showToast("Bitte zuerst anmelden ✗");return;}
 
       showToast("Importiere in Cloud…");
+      setSyncMsg("Daten werden importiert…");
       setDataLoading(true);
 
       const promises=[];
@@ -1578,6 +1605,7 @@ function App(){
       await loadAllData(uid);
 
       setDataLoading(false);
+      setSyncMsg(null);
       showToast("Import erfolgreich ✓");
     }catch(e){
       setDataLoading(false);
@@ -1615,6 +1643,7 @@ function App(){
       {/* Sync-Balken nur anzeigen wenn NICHT im aktiven Training */}
       {dataLoading&&view!=="session"&&<div style={{position:"fixed",top:0,left:0,right:0,height:3,background:C.accent,zIndex:999,animation:"timerPulse 1s infinite"}}/>}
       <Toast msg={toast}/>
+      <SyncOverlay msg={syncMsg}/>
       {prPopup&&<PRPopup prs={prPopup} onClose={()=>setPrPopup(null)}/>}
       {editingSession&&<EditSessionModal sessionKey={editingSession.key} session={editingSession.session} onSave={saveEditedSession} onClose={()=>setEditingSession(null)}/>}
       {showSettings&&<SettingsModal settings={settings} onSave={saveSettings} onClose={()=>setShowSettings(false)} onExport={exportData} onImport={importData}/>}
