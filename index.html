@@ -114,58 +114,69 @@
     // register service worker for offline support + auto-update
     if('serviceWorker' in navigator){
       window.addEventListener('load',()=>{
-        // Build timestamp baked in at file-save time — changes with every new version
-        const BUILD='__BUILD_TS__'.replace('__BUILD_TS__', Date.now());
-        const CACHE_NAME='justtrain-'+BUILD;
+        // Cache-Name basiert auf Version — ändert sich nur bei echtem Update
+        const VERSION=typeof APP_VERSION!=='undefined'?APP_VERSION:'1.1.1';
+        const CACHE_NAME='justtrain-v'+VERSION;
 
         const swCode=`
 const CACHE='${CACHE_NAME}';
+const SKIP_HOSTS=['supabase.co','cdnjs.cloudflare.com'];
 self.addEventListener('install',e=>{
-  // Skip waiting immediately — neue Version wird sofort aktiv
-  self.skipWaiting();
+  // App-Shell sofort cachen und neue Version aktivieren
+  e.waitUntil(
+    caches.open(CACHE).then(c=>c.addAll([self.location.href])).then(()=>self.skipWaiting())
+  );
 });
 self.addEventListener('activate',e=>{
-  // Alle alten Caches löschen
   e.waitUntil(
     caches.keys().then(keys=>Promise.all(
-      keys.filter(k=>k!==CACHE).map(k=>{console.log('[SW] Alter Cache gelöscht:',k);return caches.delete(k);})
+      keys.filter(k=>k!==CACHE).map(k=>caches.delete(k))
     )).then(()=>self.clients.claim())
   );
 });
 self.addEventListener('fetch',e=>{
   const url=new URL(e.request.url);
-  // Supabase-API-Anfragen niemals cachen
-  if(url.hostname.includes('supabase.co')){
-    e.respondWith(fetch(e.request));
+  // Externe APIs und CDN-Scripts: immer Netzwerk, niemals cachen
+  if(SKIP_HOSTS.some(h=>url.hostname.includes(h))){
+    e.respondWith(fetch(e.request).catch(()=>new Response('',{status:503})));
     return;
   }
-  // Für die App selbst: Network-first — versucht immer zuerst das Netz
-  // Fällt nur auf Cache zurück wenn offline
+  // App-Shell: Network-first mit Cache-Fallback (offline-fähig)
   e.respondWith(
     fetch(e.request).then(res=>{
-      if(res&&res.status===200){
+      if(res&&res.status===200&&e.request.method==='GET'){
         const clone=res.clone();
         caches.open(CACHE).then(c=>c.put(e.request,clone));
       }
       return res;
-    }).catch(()=>caches.match(e.request))
+    }).catch(()=>caches.match(e.request).then(r=>r||new Response('<h2>Offline</h2>',{headers:{'Content-Type':'text/html'}})))
   );
+});
+// Auf Message vom Client hören (z.B. "skipWaiting" für sofortiges Update)
+self.addEventListener('message',e=>{
+  if(e.data==='skipWaiting')self.skipWaiting();
 });`;
         const swBlob=new Blob([swCode],{type:'text/javascript'});
         const swUrl=URL.createObjectURL(swBlob);
-        navigator.serviceWorker.register(swUrl).then(reg=>{
+        navigator.serviceWorker.register(swUrl,{updateViaCache:'none'}).then(reg=>{
           // Prüfe auf neue Version sobald App fokussiert wird
           document.addEventListener('visibilitychange',()=>{
             if(document.visibilityState==='visible')reg.update();
           });
-          // Wenn neue Version wartet: Seite automatisch neu laden
+          // Neue Version gefunden: Update-Banner zeigen (kein Auto-Reload-Loop)
           reg.addEventListener('updatefound',()=>{
             const newSW=reg.installing;
             newSW.addEventListener('statechange',()=>{
-              if(newSW.state==='activated'&&navigator.serviceWorker.controller){
-                window.location.reload();
+              if(newSW.state==='installed'&&navigator.serviceWorker.controller){
+                // Zeige Update-Banner via Custom Event
+                window.dispatchEvent(new CustomEvent('swUpdateReady'));
               }
             });
+          });
+          // Nach skipWaiting: Seite einmalig neu laden
+          let refreshing=false;
+          navigator.serviceWorker.addEventListener('controllerchange',()=>{
+            if(!refreshing){refreshing=true;window.location.reload();}
           });
         }).catch(()=>{});
       });
@@ -182,13 +193,66 @@ self.addEventListener('fetch',e=>{
 <script type="text/babel">
 const {useState,useEffect,useRef,useCallback}=React;
 
-const APP_VERSION="1.1.0";
+const APP_VERSION="1.1.1";
+
+// ── SHARE HELPERS ─────────────────────────────────────────────────────────────
+const sharePlan=(tpl)=>{
+  const data={name:tpl.name,exercises:tpl.exercises};
+  const encoded=btoa(unescape(encodeURIComponent(JSON.stringify(data))));
+  const url=window.location.href.split('#')[0]+'#share='+encoded;
+  if(navigator.clipboard){navigator.clipboard.writeText(url).catch(()=>{});}
+  return url;
+};
+const parseShareHash=()=>{
+  try{
+    const hash=window.location.hash;
+    if(!hash.startsWith('#share='))return null;
+    const encoded=hash.slice(7);
+    return JSON.parse(decodeURIComponent(escape(atob(encoded))));
+  }catch{return null;}
+};
 
 // ── STORAGE (localStorage fallback) ──────────────────────────────────────────
 const LS={
   get:(k)=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):null}catch{return null}},
   set:(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch{}}
 };
+
+// ── OFFLINE QUEUE ────────────────────────────────────────────────────────────
+const OfflineQueue=(()=>{
+  const KEY='jt-offline-queue';
+  const load=()=>{try{return JSON.parse(localStorage.getItem(KEY)||'[]');}catch{return[];}};
+  const save=(q)=>localStorage.setItem(KEY,JSON.stringify(q));
+  const enqueue=(op)=>{
+    const q=load();
+    q.push({...op,_queuedAt:Date.now(),_id:Math.random().toString(36).slice(2)});
+    save(q);
+    console.log('[Queue] Eingereiht:',op.type);
+  };
+  const flush=async(uid)=>{
+    const q=load();
+    if(!q.length||!uid)return 0;
+    const failed=[];
+    for(const op of q){
+      try{
+        if(op.type==='upsertTemplate')    await sb.from('templates').upsert(op.payload,{onConflict:'id'});
+        else if(op.type==='upsertDayConfig') await sb.from('day_config').upsert(op.payload);
+        else if(op.type==='insertSession')   await sb.from('sessions').insert(op.payload);
+        else if(op.type==='upsertBodyWeight')await sb.from('body_weight').upsert(op.payload,{onConflict:'user_id,date'});
+        else if(op.type==='upsertSettings')  await sb.from('settings').upsert(op.payload,{onConflict:'user_id'});
+        else if(op.type==='upsertLibrary')   await sb.from('library').upsert(op.payload,{onConflict:'user_id,name'});
+        console.log('[Queue] OK:',op.type);
+      }catch(e){
+        console.warn('[Queue] Fehler:',op.type,e.message);
+        failed.push(op);
+      }
+    }
+    save(failed);
+    return q.length-failed.length;
+  };
+  const count=()=>load().length;
+  return{enqueue,flush,count};
+})();
 
 // ── SUPABASE ──────────────────────────────────────────────────────────────────
 const SUPA_URL="https://ufixuaztuhudlsxifbcv.supabase.co";
@@ -218,10 +282,11 @@ const DB={
   },
   upsertTemplate:async(uid,tpl)=>{
     const payload={user_id:uid,name:tpl.name,exercises:tpl.exercises,updated_at:new Date().toISOString()};
-    // Only include id if it's already a DB id (i.e. came from Supabase previously)
     if(tpl._dbId)payload.id=tpl._dbId;
-    const{data,error}=await sb.from("templates").upsert(payload,{onConflict:"id"}).select().single();
-    if(error)throw error; return data;
+    try{
+      const{data,error}=await sb.from("templates").upsert(payload,{onConflict:"id"}).select().single();
+      if(error)throw error; return data;
+    }catch(e){OfflineQueue.enqueue({type:'upsertTemplate',payload});throw e;}
   },
   deleteTemplate:async(id)=>{
     const{error}=await sb.from("templates").delete().eq("id",id);
@@ -237,12 +302,13 @@ const DB={
     return cfg;
   },
   upsertDayConfig:async(uid,day,cfg)=>{
-    const{error}=await sb.from("day_config").upsert({
-      user_id:uid,day_name:day,template_id:cfg.templateId||null,
+    const payload={user_id:uid,day_name:day,template_id:cfg.templateId||null,
       custom_exercises:cfg.customExercises||[],rest_day:cfg.restDay||false,
-      updated_at:new Date().toISOString()
-    },{onConflict:"user_id,day_name"});
-    if(error)throw error;
+      updated_at:new Date().toISOString()};
+    try{
+      const{error}=await sb.from("day_config").upsert(payload,{onConflict:"user_id,day_name"});
+      if(error)throw error;
+    }catch(e){OfflineQueue.enqueue({type:'upsertDayConfig',payload});}
   },
 
   // ─ SESSIONS ─
@@ -256,11 +322,16 @@ const DB={
     return result;
   },
   insertSession:async(uid,session)=>{
-    const{data,error}=await sb.from("sessions").insert({
-      user_id:uid,day_name:session.day,session_date:session.date,
-      template_name:session.templateName||"",notes:session.notes||"",exercises:session.exercises
-    }).select().single();
-    if(error)throw error; return data;
+    const payload={user_id:uid,day:session.day,date:session.date,
+      template_name:session.templateName||"",notes:session.notes||"",
+      exercises:session.exercises,duration:session.duration||0};
+    try{
+      const{data,error}=await sb.from("sessions").insert(payload).select().single();
+      if(error)throw error; return data;
+    }catch(e){
+      OfflineQueue.enqueue({type:'insertSession',payload});
+      throw e;
+    }
   },
   updateSession:async(id,session)=>{
     const{error}=await sb.from("sessions").update({
@@ -973,6 +1044,38 @@ function SyncOverlay({msg}){
   );
 }
 
+// ── SHARE IMPORT MODAL ────────────────────────────────────────────────────────
+function ShareImportModal({plan,onImport,onClose}){
+  return(
+    <div className="mo" onClick={e=>{if(e.target.className==="mo")onClose();}}>
+      <div className="ms" style={{background:C.modalBg}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}}>
+          <div style={{fontWeight:800,fontSize:18,color:C.textPrimary}}>📥 Plan importieren</div>
+          <button onClick={onClose} style={{background:"none",border:"none",color:C.textMuted,fontSize:20,cursor:"pointer"}}>✕</button>
+        </div>
+        <div style={{...sc.card,padding:"16px",marginBottom:16}}>
+          <div style={{fontSize:13,color:C.textMuted,marginBottom:8}}>Jemand hat diesen Trainingsplan mit dir geteilt:</div>
+          <div style={{fontWeight:800,fontSize:18,color:C.textPrimary,marginBottom:4}}>{plan.name}</div>
+          <div style={{fontSize:12,color:C.textMuted}}>{plan.exercises?.length||0} Übung{plan.exercises?.length===1?'':'en'}</div>
+          <div style={{marginTop:10,display:"flex",flexDirection:"column",gap:4}}>
+            {(plan.exercises||[]).map((ex,i)=>(
+              <div key={i} style={{fontSize:12,color:C.textSecondary,padding:"4px 8px",background:C.surfaceHover,borderRadius:5}}>
+                {ex.name} — {ex.sets}×{ex.reps}
+              </div>
+            ))}
+          </div>
+        </div>
+        <button onClick={onImport} style={{...sc.btnP,width:"100%",fontSize:15,padding:"13px",marginBottom:8}}>
+          ✅ Plan übernehmen
+        </button>
+        <button onClick={onClose} style={{...sc.btnS,width:"100%",fontSize:13,padding:"11px"}}>
+          Abbrechen
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── SETTINGS MODAL ───────────────────────────────────────────────────────────
 function SettingsModal({settings,onSave,onClose,onExport,onImport}){
   const [s,setS]=useState({...settings});
@@ -1240,6 +1343,28 @@ function App(){
   const [syncMsg,setSyncMsg]=useState(null);
   const sync=async(msg,fn)=>{setSyncMsg(msg);try{return await fn();}finally{setSyncMsg(null);}};
 
+  // Online-Event: ausstehende Ops aus der Queue replayen
+  useEffect(()=>{
+    const onOnline=async()=>{
+      if(!uid)return;
+      const n=await OfflineQueue.flush(uid);
+      if(n>0)showToast(`${n} gespeicherte Aktion${n===1?'':'en'} synchronisiert ✓`);
+    };
+    window.addEventListener('online',onOnline);
+    // Auch beim Start prüfen falls Queue voll
+    if(navigator.onLine)onOnline();
+    return()=>window.removeEventListener('online',onOnline);
+  },[uid]);
+
+  // SW Update-Banner
+  const [swUpdate,setSwUpdate]=useState(false);
+  const [sharedPlan,setSharedPlan]=useState(()=>parseShareHash());
+  useEffect(()=>{
+    const handler=()=>setSwUpdate(true);
+    window.addEventListener('swUpdateReady',handler);
+    return()=>window.removeEventListener('swUpdateReady',handler);
+  },[]);;
+
   // Load all data from Supabase
   const loadAllData=async(uid)=>{
     setDataLoading(true);
@@ -1501,6 +1626,19 @@ function App(){
     const dc={...dayConfig};DAYS.forEach(d=>{if(dc[d].templateId===id){dc[d]={...dc[d],templateId:null};if(uid)DB.upsertDayConfig(uid,d,dc[d]).catch(()=>{});}});
     setDayConfig(dc);showToast("Plan gelöscht");
   };
+  const importSharedPlan=(plan)=>{
+    const newPlan={id:genId(),name:plan.name,exercises:(plan.exercises||[]).map(ex=>({...ex,id:genId()})),isNew:true};
+    if(uid){
+      sync("Plan wird importiert…",()=>DB.upsertTemplate(uid,newPlan))
+        .then(row=>{newPlan._dbId=row.id;newPlan.id=row.id;})
+        .catch(()=>{});
+    }
+    setTemplates(prev=>[...prev,newPlan]);
+    setSharedPlan(null);
+    window.location.hash='';
+    showToast("Plan übernommen ✓");
+  };
+
   const addExToTpl=()=>{
     if(!newTplEx.name.trim())return;
     setEditingTpl(prev=>({...prev,exercises:[...prev.exercises,{...newTplEx,id:genId()}]}));
@@ -1641,7 +1779,24 @@ function App(){
   return(
     <div style={{minHeight:"100vh",background:C.bg,color:C.textPrimary,fontFamily:"-apple-system,'Inter','Segoe UI',sans-serif",fontSize:14,paddingTop:"env(safe-area-inset-top)",transition:"background .25s,color .25s"}}>
       {/* Sync-Balken nur anzeigen wenn NICHT im aktiven Training */}
+      {/* SW Update Banner */}
+      {swUpdate&&(
+        <div style={{position:"fixed",top:0,left:0,right:0,zIndex:1300,background:"#1e3a5f",borderBottom:"2px solid #60a5fa",padding:"10px 16px",display:"flex",alignItems:"center",justifyContent:"space-between",gap:12}}>
+          <span style={{fontSize:13,color:"#bfdbfe",fontWeight:600}}>🔄 Neue Version verfügbar</span>
+          <button onClick={()=>{navigator.serviceWorker.controller?.postMessage('skipWaiting');}}
+            style={{background:"#3b82f6",color:"#fff",border:"none",borderRadius:6,padding:"6px 14px",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"inherit"}}>
+            Jetzt aktualisieren
+          </button>
+        </div>
+      )}
+      {/* Offline Indikator */}
+      {!navigator.onLine&&<div style={{position:"fixed",top:swUpdate?44:0,left:0,right:0,zIndex:1299,background:"#78350f",borderBottom:"2px solid #f59e0b",padding:"6px 16px",textAlign:"center",fontSize:12,color:"#fde68a",fontWeight:600}}>
+        📡 Offline — Änderungen werden gespeichert und synchronisiert sobald du wieder online bist
+      </div>}
+      {/* Ladebalken */}
       {dataLoading&&view!=="session"&&<div style={{position:"fixed",top:0,left:0,right:0,height:3,background:C.accent,zIndex:999,animation:"timerPulse 1s infinite"}}/>}
+      {/* Share Import Modal */}
+      {sharedPlan&&user&&<ShareImportModal plan={sharedPlan} onImport={()=>importSharedPlan(sharedPlan)} onClose={()=>{setSharedPlan(null);window.location.hash='';}}/>}
       <Toast msg={toast}/>
       <SyncOverlay msg={syncMsg}/>
       {prPopup&&<PRPopup prs={prPopup} onClose={()=>setPrPopup(null)}/>}
@@ -1827,6 +1982,8 @@ function App(){
             {/* Speichern-Buttons oben — immer sichtbar, egal wie viele Übungen */}
             <div style={{display:"flex",gap:8,marginBottom:16}}>
               <button onClick={saveTpl} style={{...sc.btnP,flex:1,fontSize:14}}>💾 Plan speichern</button>
+              {!editingTpl.isNew&&<button onClick={()=>{sharePlan(editingTpl);showToast("Link kopiert ✓");}}
+                style={{...sc.btnS,padding:"10px 14px",fontSize:15}} title="Plan teilen">🔗</button>}
               <button onClick={()=>setEditingTpl(null)} style={sc.btnS}>Abbrechen</button>
             </div>
 
