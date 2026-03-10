@@ -181,6 +181,8 @@ self.addEventListener('fetch',e=>{
 <script type="text/babel">
 const {useState,useEffect,useRef,useCallback}=React;
 
+const APP_VERSION="1.0.7";
+
 // ── STORAGE (localStorage fallback) ──────────────────────────────────────────
 const LS={
   get:(k)=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):null}catch{return null}},
@@ -670,6 +672,10 @@ function WeightInput({value,onChange,color,style={}}){
         inputMode="text"
         value={value}
         placeholder="kg oder 4×25"
+        autoComplete="off"
+        autoCorrect="off"
+        autoCapitalize="none"
+        spellCheck={false}
         onChange={e=>onChange(e.target.value)}
         style={{...sc.inp,textAlign:"center",fontWeight:700,fontSize:14,padding:"10px",paddingBottom:isMulti&&pw.total>0?"20px":"10px",color:color,...style}}
       />
@@ -1155,6 +1161,7 @@ function AuthScreen({onAuth}){
       <div style={{marginTop:16,fontSize:12,color:C.textMuted,textAlign:"center"}}>
         Deine Daten werden sicher in der Cloud gespeichert.<br/>Kein Gerät gebunden — überall verfügbar.
       </div>
+      <div style={{marginTop:8,fontSize:11,color:C.textMuted,opacity:0.5}}>v{APP_VERSION}</div>
     </div>
   );
 }
@@ -1620,7 +1627,7 @@ function App(){
           <div>
             <div style={{fontSize:11,fontWeight:700,letterSpacing:"0.2em",color:C.accent,marginBottom:2}}>YOUR GYM COMPANION</div>
             <h1 style={{margin:0,fontSize:28,fontWeight:900,color:C.textPrimary,letterSpacing:"-0.04em"}}>Just<span style={{color:C.accent}}>Train</span></h1>
-            <div style={{fontSize:11,color:C.textMuted,marginTop:3}}>{user.user_metadata?.display_name||user.email?.split("@")[0]||"Nutzer"}</div>
+            <div style={{fontSize:11,color:C.textMuted,marginTop:3}}>{user.user_metadata?.display_name||user.email?.split("@")[0]||"Nutzer"} <span style={{opacity:0.4}}>· v{APP_VERSION}</span></div>
           </div>
           <div style={{display:"flex",gap:6,alignItems:"center",flexShrink:0}}>
             {installPrompt&&(
