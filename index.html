@@ -193,7 +193,7 @@ self.addEventListener('message',e=>{
 <script type="text/babel">
 const {useState,useEffect,useRef,useCallback}=React;
 
-const APP_VERSION="1.1.1";
+const APP_VERSION="1.1.2";
 
 // ── SHARE HELPERS ─────────────────────────────────────────────────────────────
 const sharePlan=(tpl)=>{
@@ -253,6 +253,21 @@ const OfflineQueue=(()=>{
   const count=()=>load().length;
   return{enqueue,flush,count};
 })();
+
+// ── LOCAL CACHE ──────────────────────────────────────────────────────────────
+// Spiegelt alle Supabase-Daten lokal — App läuft auch offline vollständig
+const LocalCache={
+  key:(uid)=>'jt-cache-'+uid,
+  save:(uid,data)=>{
+    try{localStorage.setItem(LocalCache.key(uid),JSON.stringify({...data,_savedAt:Date.now()}));}
+    catch(e){console.warn('[Cache] Speichern fehlgeschlagen:',e.message);}
+  },
+  load:(uid)=>{
+    try{const v=localStorage.getItem(LocalCache.key(uid));return v?JSON.parse(v):null;}
+    catch{return null;}
+  },
+  clear:(uid)=>{try{localStorage.removeItem(LocalCache.key(uid));}catch{}},
+};
 
 // ── SUPABASE ──────────────────────────────────────────────────────────────────
 const SUPA_URL="https://ufixuaztuhudlsxifbcv.supabase.co";
@@ -1341,6 +1356,23 @@ function App(){
   const [darkMode,setDarkMode]=useState(()=>LS.get("jt-darkmode")!==false);
   const [dataLoading,setDataLoading]=useState(false);
   const [syncMsg,setSyncMsg]=useState(null);
+
+  // Refs für Cache-Snapshots (immer aktueller Wert ohne Re-Render)
+  const cacheRef=useRef({templates:[],dayConfig:{},sessions:{},bodyWeight:[],library:[],settings:{}});
+  const userRef=useRef(null);
+  useEffect(()=>{userRef.current=user;},[user]);
+  const updateCache=(patch)=>{
+    cacheRef.current={...cacheRef.current,...patch};
+    const cUid=userRef.current?.id;
+    if(cUid)LocalCache.save(cUid,cacheRef.current);
+  };
+  // Gewrappte Setter die gleichzeitig den Cache aktualisieren
+  const setTpl=(v)=>{const val=typeof v==='function'?v(cacheRef.current.templates):v;setTemplates(val);updateCache({templates:val});};
+  const setDC=(v)=>{const val=typeof v==='function'?v(cacheRef.current.dayConfig):v;setDayConfig(val);updateCache({dayConfig:val});};
+  const setSess=(v)=>{const val=typeof v==='function'?v(cacheRef.current.sessions):v;setSessions(val);updateCache({sessions:val});};
+  const setBW=(v)=>{const val=typeof v==='function'?v(cacheRef.current.bodyWeight):v;setBodyWeight(val);updateCache({bodyWeight:val});};
+  const setLib=(v)=>{const val=typeof v==='function'?v(cacheRef.current.library):v;setLibrary(val);updateCache({library:val});};
+  const setSett=(v)=>{const val=typeof v==='function'?v(cacheRef.current.settings):v;setSettings(val);updateCache({settings:val});};
   const sync=async(msg,fn)=>{setSyncMsg(msg);try{return await fn();}finally{setSyncMsg(null);}};
 
   // Online-Event: ausstehende Ops aus der Queue replayen
@@ -1365,8 +1397,39 @@ function App(){
     return()=>window.removeEventListener('swUpdateReady',handler);
   },[]);;
 
-  // Load all data from Supabase
+  // Load all data — sofort Cache, dann Supabase im Hintergrund
+  const applyData=(tpls,dc,sess,bw,lib,sett,saveCache=false)=>{
+    const s=sett?{timerEnabled:sett.timerEnabled??false,timerDuration:sett.timerDuration??90,darkMode:sett.darkMode}:null;
+    // State setzen
+    setTemplates(tpls);setDayConfig(dc);setSessions(sess);setBodyWeight(bw);setLibrary(lib);
+    if(s){setSettings({timerEnabled:s.timerEnabled,timerDuration:s.timerDuration});if(s.darkMode!==undefined)setDarkMode(s.darkMode);}
+    // cacheRef synchron befüllen
+    cacheRef.current={templates:tpls,dayConfig:dc,sessions:sess,bodyWeight:bw,library:lib,settings:s||cacheRef.current.settings};
+    if(saveCache&&uid)LocalCache.save(uid,cacheRef.current);
+  };
+
   const loadAllData=async(uid)=>{
+    // ── Schritt 1: Sofort aus lokalem Cache laden (kein Warten auf Netz) ──
+    const cached=LocalCache.load(uid);
+    if(cached){
+      applyData(
+        cached.templates||[],
+        cached.dayConfig||Object.fromEntries(DAYS.map(d=>[d,{templateId:null,customExercises:[],restDay:false}])),
+        cached.sessions||{},
+        cached.bodyWeight||[],
+        cached.library||[],
+        cached.settings||null,
+        false // nicht re-speichern
+      );
+      console.log('[Cache] Offline-Daten geladen:',Object.keys(cached.sessions||{}).length,'Sessions,',( cached.templates||[]).length,'Pläne');
+    }
+
+    // ── Schritt 2: Supabase im Hintergrund laden und Cache aktualisieren ──
+    if(!navigator.onLine){
+      setDataLoading(false);
+      if(!cached)showToast("Offline — keine lokalen Daten vorhanden");
+      return;
+    }
     setDataLoading(true);
     try{
       const[tpls,dc,sess,bw,lib,sett]=await Promise.all([
@@ -1377,16 +1440,11 @@ function App(){
         DB.getLibrary(uid),
         DB.getSettings(uid),
       ]);
-      setTemplates(tpls);
-      setDayConfig(dc);
-      setSessions(sess);
-      setBodyWeight(bw);
-      setLibrary(lib);
-      if(sett){
-        setSettings({timerEnabled:sett.timerEnabled,timerDuration:sett.timerDuration});
-        if(sett.darkMode!==undefined)setDarkMode(sett.darkMode);
-      }
-    }catch(e){console.error("Load error:",e);}
+      applyData(tpls,dc,sess,bw,lib,sett,true);
+    }catch(e){
+      console.error("Load error:",e);
+      if(!cached)showToast("Laden fehlgeschlagen — bitte Verbindung prüfen");
+    }
     finally{setDataLoading(false);}
   };
 
@@ -1450,7 +1508,7 @@ function App(){
     // Note: individual template upserts happen in createTpl/saveTpl/deleteTpl
   };
   const saveDC=async(v,changedDay)=>{
-    setDayConfig(v);
+    setDC(v);
     if(uid&&changedDay){
       try{await DB.upsertDayConfig(uid,changedDay,v[changedDay]);}catch(e){console.error(e);}
     } else if(uid){
@@ -1462,7 +1520,7 @@ function App(){
   const saveBW=(v)=>setBodyWeight(v);
   const saveLib=(v)=>setLibrary(v);
   const saveSettings=async(v)=>{
-    setSettings(v);
+    setSett(v);
     LS.set("jt-settings",v);
     if(uid){await sync("Einstellungen werden gespeichert…",()=>DB.upsertSettings(uid,{...v,darkMode}).catch(e=>console.error(e)));}
   };
@@ -1571,7 +1629,7 @@ function App(){
     const entry={day:activeDay,date:sessionDate,templateName:tplName,notes:sessionNotes,exercises:exercisesData};
     // Lokalen Key generieren
     const localKey=`local-${Date.now()}`;
-    setSessions(prev=>({...prev,[localKey]:entry}));
+    setSess(prev=>({...prev,[localKey]:entry}));
     setView("plan");
     setActiveTimer(null);
     showToast("Training gespeichert 🎯");
@@ -1581,7 +1639,7 @@ function App(){
       setSyncMsg("Training wird synchronisiert…");
       DB.insertSession(uid,entry).then(row=>{
         // Lokalen Eintrag durch DB-Eintrag ersetzen
-        setSessions(prev=>{
+        setSess(prev=>{
           const u={...prev};
           delete u[localKey];
           u[row.id]={...entry,_dbId:row.id};
@@ -1616,13 +1674,13 @@ function App(){
       return;
     }
     const updated=editingTpl.isNew?[...templates,tpl]:templates.map(t=>t.id===tpl.id?tpl:t);
-    setTemplates(updated);
+    setTpl(updated);
     setEditingTpl(null);showToast("Plan gespeichert ✓");
   };
   const deleteTpl=async(id)=>{
     const tpl=templates.find(t=>t.id===id);
     try{if(uid&&tpl?._dbId)await DB.deleteTemplate(tpl._dbId);}catch(e){console.error(e);}
-    setTemplates(templates.filter(t=>t.id!==id));
+    setTpl(templates.filter(t=>t.id!==id));
     const dc={...dayConfig};DAYS.forEach(d=>{if(dc[d].templateId===id){dc[d]={...dc[d],templateId:null};if(uid)DB.upsertDayConfig(uid,d,dc[d]).catch(()=>{});}});
     setDayConfig(dc);showToast("Plan gelöscht");
   };
@@ -1654,14 +1712,14 @@ function App(){
     try{
       if(uid&&sessions[key]?._dbId)await sync("Training wird aktualisiert…",()=>DB.updateSession(sessions[key]._dbId,updated));
     }catch(e){console.error(e);}
-    setSessions(prev=>({...prev,[key]:{...updated,_dbId:prev[key]?._dbId}}));
+    setSess(prev=>({...prev,[key]:{...updated,_dbId:prev[key]?._dbId}}));
     setEditingSession(null);showToast("Training aktualisiert ✓");
   };
   const deleteSession=async(key)=>{
     try{
       if(uid&&sessions[key]?._dbId)await DB.deleteSession(sessions[key]._dbId);
     }catch(e){console.error(e);}
-    setSessions(prev=>{const u={...prev};delete u[key];return u;});
+    setSess(prev=>{const u={...prev};delete u[key];return u;});
     showToast("Training gelöscht");
   };
 
@@ -1669,25 +1727,25 @@ function App(){
   const addToLibrary=async(ex)=>{
     if(!ex.name.trim())return;
     const entry={id:genId(),name:ex.name,muscles:ex.muscles||[],sets:ex.sets||3,reps:ex.reps||10};
-    setLibrary(prev=>[...prev.filter(l=>l.name!==ex.name),entry]);
+    setLib(prev=>[...prev.filter(l=>l.name!==ex.name),entry]);
     try{if(uid)await sync("Bibliothek wird gespeichert…",()=>DB.upsertLibraryEntry(uid,entry));}catch(e){console.error(e);}
     showToast("Zur Bibliothek hinzugefügt ✓");
   };
   const deleteLibraryEntry=async(id)=>{
     const entry=library.find(l=>l.id===id);
-    setLibrary(prev=>prev.filter(l=>l.id!==id));
+    setLib(prev=>prev.filter(l=>l.id!==id));
     try{if(uid&&entry)await DB.deleteLibraryEntry(uid,entry.name);}catch(e){console.error(e);}
   };
 
   // ─ BODY WEIGHT ─
   const addBodyWeight=async(entry)=>{
-    setBodyWeight(prev=>[...prev.filter(e=>e.date!==entry.date),entry].sort((a,b)=>a.date.localeCompare(b.date)));
+    setBW(prev=>[...prev.filter(e=>e.date!==entry.date),entry].sort((a,b)=>a.date.localeCompare(b.date)));
     try{if(uid)await sync("Gewicht wird gespeichert…",()=>DB.upsertBodyWeight(uid,entry));}catch(e){console.error(e);}
     showToast("Gewicht gespeichert ✓");
   };
   const deleteBodyWeight=async(id)=>{
     const entry=bodyWeight.find(e=>e.id===id);
-    setBodyWeight(prev=>prev.filter(e=>e.id!==id));
+    setBW(prev=>prev.filter(e=>e.id!==id));
     try{if(uid&&entry)await DB.deleteBodyWeight(uid,entry.date);}catch(e){console.error(e);}
   };
 
@@ -1828,7 +1886,7 @@ function App(){
             <button onClick={()=>setShowSettings(true)}
               style={{background:C.surfaceHover,border:`1px solid ${C.border}`,color:C.textMuted,padding:"8px 10px",cursor:"pointer",fontSize:15,fontFamily:"inherit",borderRadius:8,lineHeight:1}}
               title="Einstellungen">⚙️</button>
-            <button onClick={async()=>{await DB.signOut();setUser(null);setTemplates([]);setSessions({});setDayConfig(Object.fromEntries(DAYS.map(d=>[d,{templateId:null,customExercises:[],restDay:false}])));setBodyWeight([]);setLibrary([]);}}
+            <button onClick={async()=>{const logoutUid=user?.id;await DB.signOut();if(logoutUid)LocalCache.clear(logoutUid);setUser(null);setTemplates([]);setSessions({});setDayConfig(Object.fromEntries(DAYS.map(d=>[d,{templateId:null,customExercises:[],restDay:false}])));setBodyWeight([]);setLibrary([]);}}
               style={{background:C.surfaceHover,border:`1px solid ${C.border}`,color:C.textMuted,padding:"8px 10px",cursor:"pointer",fontSize:15,fontFamily:"inherit",borderRadius:8,lineHeight:1}}
               title="Abmelden">🚪</button>
           </div>
